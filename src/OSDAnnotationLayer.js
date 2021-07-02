@@ -51,8 +51,8 @@ export default class OSDAnnotationLayer extends EventEmitter {
 
       // In collectionMode, use separate drawing tools for
       // separate images
-      if(this.viewer.collectionMode) {
-        const itemCount = this.viewer.world.getItemCount();
+      const itemCount = this.viewer.world.getItemCount();
+      if(itemCount > 1) {
         for (let i = 1; i < itemCount; i++){
           const tileSource = this.viewer.world.getItemAt(i);
           const {x, y} = tileSource.source.dimensions;
