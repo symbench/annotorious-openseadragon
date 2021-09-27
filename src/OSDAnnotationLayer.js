@@ -7,6 +7,7 @@ import { drawShape, shapeArea } from '@recogito/annotorious/src/selectors';
 import { format } from '@recogito/annotorious/src/util/Formatting';
 import { isTouchDevice, enableTouchTranslation } from '@recogito/annotorious/src/util/Touch';
 import { getSnippet } from './util/ImageSnippet';
+import {range, getURL, pointInsideBounds, bboxInsideImage, sortByShapeArea} from './util/Misc';
 
 /**
  * Code shared between (normal) OSDAnnotationLayer and
@@ -41,27 +42,33 @@ export class AnnotationLayer extends EventEmitter {
     
     this.viewer.canvas.appendChild(this.svg);
 
-    this.viewer.addHandler('animation', () => this.resize());
-    this.viewer.addHandler('rotate', () => this.resize());
-    this.viewer.addHandler('resize', () => this.resize());
-    this.viewer.addHandler('flip', () => this.resize());
+    this.viewer.addHandler('animation', () => this.resizeAnnotationLayers());
+    this.viewer.addHandler('rotate', () => this.resizeAnnotationLayers());
+    this.viewer.addHandler('resize', () => this.resizeAnnotationLayers());
+    this.viewer.addHandler('flip', () => this.resizeAnnotationLayers());
 
     const onLoad = () => {
-      const { x, y } = this.viewer.world.getItemAt(0).source.dimensions;
-
-      props.env.image = {
-        src: this.viewer.world.getItemAt(0).source['@id'] || 
-          new URL(this.viewer.world.getItemAt(0).source.url, document.baseURI).href,
-        naturalWidth: x,
-        naturalHeight: y
-      };
+      props.env.image = this._getTiledImageEnv(this.viewer.world.getItemAt(0));
 
       if (props.config.crosshair) {
         this.crosshair = new Crosshair(this.g, x, y);
         addClass(this.svg, 'has-crosshair');
       }
 
-      this.resize();      
+      const remainingImages = this._getRemainingTiledImages();
+      if (remainingImages) {
+        remainingImages.forEach(tiledImage => {
+          const env = Object.assign({}, props.env);
+          env.image = this._getTiledImageEnv(tiledImage);
+          const g = document.createElementNS(SVG_NAMESPACE, 'g');
+          const tool = new DrawingTools(g, props.config, env);
+          this.annotationLayers.push([g, tool]);
+        });
+      }
+
+      this._addDeferredAnnotations();
+
+      this.resizeAnnotationLayers();
     }
 
     // Store image properties on open (incl. after page change) and on addTiledImage
@@ -75,9 +82,73 @@ export class AnnotationLayer extends EventEmitter {
     this.selectedShape = null;
 
     this.tools = new DrawingTools(this.g, props.config, props.env);
+
+    this.annotationLayers = [[this.g, this.tools]];
+    this.deferredAnnotations = [];
     
     this._deselectOnClickOutside();
     this._initDrawingMouseTracker();
+  }
+
+  _addDeferredAnnotations = () => {
+    this.deferredAnnotations.forEach(this.addAnnotation);
+    this.deferredAnnotations = [];
+  }
+
+  _getTiledImageEnv = (tiledImage) => {
+    const { x, y } = this.viewer.world.getItemAt(0).source.dimensions;
+    return {
+      src: tiledImage.source['@id'] || new URL(tiledImage.source.url, document.baseURI).href,
+      naturalWidth: x,
+      naturalHeight: y,
+    };
+  }
+
+  _getRemainingTiledImages = () => {
+    const osdInMultiImageMode = () => {
+        const count = this.viewer.world.getItemCount();
+        return count > 1 ? count: 0;
+      }
+
+      if (osdInMultiImageMode()) {
+        return range(this.viewer.world.getItemCount()-1, 1).map(index => {
+            return this.viewer.world.getItemAt(index);
+        });
+      }
+  }
+
+  _getTiledImages = () => {
+    return range(this.viewer.world.getItemCount())
+      .map(idx => {
+        console.log(this.viewer.world.getItemAt(idx));
+        return this.viewer.world.getItemAt(idx);
+      });
+  }
+
+  _getTiledImageFromURL = url => {
+    const allImages = this._getTiledImages();
+    const match = allImages
+      .find(tiledImage => getURL(tiledImage.source.url).href === getURL(url).href);
+    // Fall back to first image in the viewer
+    return match || allImages[0];
+  }
+
+  _selectLayer = position => {
+    const allImages = this._getTiledImages();
+    return allImages.find((tiledImage, index) => {
+      const bounds = tiledImage.getBounds(true);
+      const viewPortCoordinates = this.viewer.viewport.viewerElementToViewportCoordinates(position);
+      return pointInsideBounds(bounds, viewPortCoordinates) ? this.annotationLayers[index] : this.annotationLayers[0];
+    });
+  }
+
+  _selectLayerByTarget = target => {
+    if (!target) {
+      return this.annotationLayers[0];
+    } else {
+      const tiledImage = this._getTiledImageFromURL(target.source);
+      return this.viewer.world.getIndexOfItem(tiledImage);
+    }
   }
 
   /** Adds handler logic to deselect when clicking outside a shape **/
@@ -115,6 +186,8 @@ export class AnnotationLayer extends EventEmitter {
       element: this.svg,
 
       pressHandler: evt => {
+        const activeLayer = this._selectLayer(evt.position) || this.annotationLayers[0];
+        this.tools = activeLayer[1];
         if (!this.tools.current.isDrawing) {
           this.tools.current.start(evt.originalEvent);
           // this.tools.current.scaleHandles(1 / this.currentScale());
@@ -217,7 +290,13 @@ export class AnnotationLayer extends EventEmitter {
   }
 
   addAnnotation = annotation => {
-    const shape = drawShape(annotation, this.env.image);
+    if (!this.viewer.isOpen()) {
+      this.deferredAnnotations.push(annotation);
+      return;
+    }
+
+    const [g, tools] = this._selectLayerByTarget(annotation.target);
+    const shape = drawShape(annotation, tools._env.image);
     shape.setAttribute('class', 'a9s-annotation');
 
     shape.setAttribute('data-id', annotation.id);
@@ -225,7 +304,7 @@ export class AnnotationLayer extends EventEmitter {
 
     this._attachMouseListeners(shape, annotation);
 
-    this.g.appendChild(shape);
+    g.appendChild(shape);
 
     format(shape, annotation, this.formatter);
 
@@ -249,10 +328,16 @@ export class AnnotationLayer extends EventEmitter {
     this.redraw();
   }
 
-  currentScale = () => {
+  currentScale = (item) => {
     const containerWidth = this.viewer.viewport.getContainerSize().x;
     const zoom = this.viewer.viewport.getZoom(true);
-    return zoom * containerWidth / this.viewer.world.getContentFactor();
+    let contentFactor;
+    if (item) {
+      contentFactor = item.getContentSize().x / item.getBounds().width;
+    } else {
+      contentFactor = this.viewer.world.getContentFactor();
+    }
+    return zoom * containerWidth / contentFactor;
   }
 
   deselect = skipRedraw => {
@@ -284,21 +369,31 @@ export class AnnotationLayer extends EventEmitter {
 
   findShape = annotationOrId => {
     const id = annotationOrId?.id ? annotationOrId.id : annotationOrId;
-    return this.g.querySelector(`.a9s-annotation[data-id="${id}"]`);
+    const annotationSVGGroups = this.annotationLayers.map(([g, _]) => g);
+    return annotationSVGGroups
+      .map(g => g.querySelector(`.a9s-annotation[data-id="${id}"]`))
+      .find(shape => !!shape);
   }
 
   fitBounds = (annotationOrId, immediately) => {
     const shape = this.findShape(annotationOrId);
     if (shape) {
+      const annotation = shape.annotation;
+      const tileSource = this._getTiledImageFromURL(annotation.target.source);
       const { x, y, width, height } = shape.getBBox(); // SVG element bounds, image coordinates
-      const rect = this.viewer.viewport.imageToViewportRectangle(x, y, width, height);
+      const rect = tileSource.imageToViewportRectangle(x, y, width, height);
       this.viewer.viewport.fitBounds(rect, immediately);
     }    
   }
 
+  _getAnnotationShapes = () => {
+    return this.annotationLayers
+        .map(([g, _]) => Array.from(g.querySelectorAll('.a9s-annotation')));
+  }
+
   getAnnotations = () => {
-    const shapes = Array.from(this.g.querySelectorAll('.a9s-annotation'));
-    return shapes.map(s => s.annotation);
+    return this._getAnnotationShapes()
+      .flat().map(s => s.annotation);
   }
 
   getSelectedImageSnippet = () => {
@@ -312,11 +407,12 @@ export class AnnotationLayer extends EventEmitter {
     // Clear existing
     this.deselect();
 
-    const shapes = Array.from(this.g.querySelectorAll('.a9s-annotation'));
-    shapes.forEach(s => this.g.removeChild(s));
+    const shapes = this._getAnnotationShapes();
+    const svgLayers = this.annotationLayers.map(([g, _]) => g);
+    svgLayers.forEach((g, index) => shapes[index].forEach(g.removeChild));
 
     // Add
-    annotations.sort((a, b) => shapeArea(b, this.env.image) - shapeArea(a, this.env.image));
+    sortByShapeArea(shapes.map(s => s.annotation));
     annotations.forEach(this.addAnnotation);
   }
 
@@ -352,15 +448,25 @@ export class AnnotationLayer extends EventEmitter {
 
   redraw = () => {
     // The selected annotation shape
-    const selected = this.g.querySelector('.a9s-annotation.selected');
+    // const selected = this.g.querySelector('.a9s-annotation.selected');
+    //
+    // // All other shapes and annotations
+    // const unselected = Array.from(this.g.querySelectorAll('.a9s-annotation:not(.selected)'));
+    // const annotations = unselected.map(s => s.annotation);
+    // annotations.sort((a, b) => shapeArea(b, this.env.image) - shapeArea(a, this.env.image));
+    let selected, selectedParentLayer, annotations = [];
+    this.annotationLayers.forEach(([g, _]) => {
+      selectedParentLayer = g;
+      selected = g.querySelector('.a9s-annotation.selected');
+      const unselected = Array.from(g.querySelectorAll('.a9s-annotation:not(.selected)'));
+      annotations.push(...unselected.map(s => s.annotation));
+       // Clear unselected annotations
+      unselected.forEach(g.removeChild);
+    });
 
-    // All other shapes and annotations
-    const unselected = Array.from(this.g.querySelectorAll('.a9s-annotation:not(.selected)'));
-    const annotations = unselected.map(s => s.annotation);
-    annotations.sort((a, b) => shapeArea(b, this.env.image) - shapeArea(a, this.env.image));
 
-    // Clear unselected annotations and redraw
-    unselected.forEach(s => this.g.removeChild(s));
+    // Redraw after sort
+    sortByShapeArea(annotations);
     annotations.forEach(this.addAnnotation);
 
     // Then re-draw the selected on top, if any
@@ -371,10 +477,10 @@ export class AnnotationLayer extends EventEmitter {
       // beneath this.g
       let toRedraw = selected;
       
-      while (toRedraw.parentNode !== this.g)
+      while (toRedraw.parentNode !== selectedParentLayer)
         toRedraw = toRedraw.parentNode;
 
-      this.g.appendChild(toRedraw);
+      selectedParentLayer.appendChild(toRedraw);
     } 
   }
   
@@ -395,20 +501,28 @@ export class AnnotationLayer extends EventEmitter {
     }
   }
 
-  resize() {
+  resizeAnnotationLayers = () => {
+    this.annotationLayers.forEach(([g, tool], index) => {
+      const item = this.viewer.world.getItemAt(index);
+      const imageBbox = item.getBounds(true);
+      this.resize(g, item, new OpenSeadragon.Point(imageBbox.x, imageBbox.y));
+    });
+  }
+
+  resize(g, item, viewPortPoint) {
     const flipped = this.viewer.viewport.getFlip();
 
-    const p = this.viewer.viewport.pixelFromPoint(new OpenSeadragon.Point(0, 0), true);
+    const p = this.viewer.viewport.pixelFromPoint(viewPortPoint, true);
     if (flipped)
       p.x = this.viewer.viewport._containerInnerSize.x - p.x;
 
-    const scaleY = this.currentScale();
+    const scaleY = this.currentScale(item);
     const scaleX = flipped ? - scaleY : scaleY;
     const rotation = this.viewer.viewport.getRotation();
 
-    this.g.setAttribute('transform', `translate(${p.x}, ${p.y}) scale(${scaleX}, ${scaleY}) rotate(${rotation})`);
+    g.setAttribute('transform', `translate(${p.x}, ${p.y}) scale(${scaleX}, ${scaleY}) rotate(${rotation})`);
 
-    this.scaleFormatterElements();
+    this.scaleFormatterElements(null, item);
 
     if (this.selectedShape) {
       if (this.selectedShape.element) { // Editable shape
@@ -423,15 +537,16 @@ export class AnnotationLayer extends EventEmitter {
       this.tools.current.scaleHandles(1 / scaleY);
   }
   
-  scaleFormatterElements = opt_shape => {
-    const scale = 1 / this.currentScale();
+  scaleFormatterElements = (opt_shape, item) => {
+    const scale = 1 / this.currentScale(item);
 
     if (opt_shape) {
       const el = opt_shape.querySelector('.a9s-formatter-el');
       if (el)
         el.firstChild.setAttribute('transform', `scale(${scale})`);
     } else {
-      const elements = Array.from(this.g.querySelectorAll('.a9s-formatter-el'));
+      const elements = this.annotationLayers
+        .flatMap(([g, _]) => Array.from(g.querySelectorAll('.a9s-formatter-el')));
       elements.forEach(el =>
         el.firstChild.setAttribute('transform', `scale(${scale})`));
     }
@@ -484,10 +599,14 @@ export class AnnotationLayer extends EventEmitter {
         if (!skipEvent)
           this.emit('select', { annotation, element: this.selectedShape.element });
       }, 1);
-
-      const toolForAnnotation = this.tools.forAnnotation(annotation);
+      const annotationLayer = this._selectLayerByTarget(annotation.target) || this.annotationLayers[0];
+      const toolForAnnotation = annotationLayer[1].forAnnotation(annotation);
       this.selectedShape = toolForAnnotation.createEditableShape(annotation);
-      this.selectedShape.scaleHandles(1 / this.currentScale());
+      this.selectedShape.scaleHandles(
+        1 / this.currentScale(
+          null, this._getTiledImageFromURL(annotation.target.source)
+        )
+      );
 
       this.scaleFormatterElements(this.selectedShape.element);
 
@@ -551,10 +670,14 @@ export default class OSDAnnotationLayer extends AnnotationLayer {
   constructor(props) {
     super(props);
 
-    this.tools.on('complete', shape => { 
-      this.selectShape(shape);
-      this.emit('createSelection', shape.annotation);
-      this.mouseTracker.setTracking(false);
+    this.annotationLayers.forEach(([g, tools]) => {
+      tools.on('complete', shape => {
+        if(bboxInsideImage(tools._env.image), shape.getBBox()){
+          this.selectShape(shape);
+          this.emit('createSelection', shape.annotation);
+        }
+        this.mouseTracker.setTracking(false);
+      });
     });
   }
 
