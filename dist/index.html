@@ -65,16 +65,23 @@
         var viewer = OpenSeadragon({
           id: "openseadragon",
           prefixUrl: "openseadragon/images/",
-          tileSources: {
-            type: "image",
-            url: "1280px-Hallstatt.jpg"
-          },
+          tileSources: [
+            'https://iiif.bodleian.ox.ac.uk/iiif/image/b94720e9-1aa5-4cf8-95c2-e1266bd50beb/info.json',
+            // 'https://iiif.bodleian.ox.ac.uk/iiif/image/a4ea7279-0d6f-42b9-96bf-bb4fe7178dfb/info.json'
+          ],
           gestureSettingsTouch: {
             pinchRotate: true
           },
           showRotationControl: true,
           showFlipControl: true,
           constrainDuringPan: true,
+        });
+
+        viewer.addTiledImage({
+          tileSource: 'https://iiif.bodleian.ox.ac.uk/iiif/image/a4ea7279-0d6f-42b9-96bf-bb4fe7178dfb/info.json',
+          x: 0,
+          y: 0,
+          width: 0.4
         });
         
         var anno = OpenSeadragon.Annotorious(viewer, {
